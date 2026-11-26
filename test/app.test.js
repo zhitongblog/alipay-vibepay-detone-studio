@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const { analyzeArticle, toFreePreview } = require("../src/analyzer");
 const { AlipayWebPayClient } = require("../src/alipay-client");
+const { issuePasscode, verifyPasscode } = require("../src/passcode");
 const { createApp } = require("../src/server");
 
 test("analyzer detects A-tier cliches, B-tier structures, and rewrites cleanly", () => {
@@ -184,5 +185,192 @@ test("WatchaPay personal Vibe Pay fail-closed and entitlement grant flow", async
     assert.ok(dOk.fullReport && dOk.fullReport.rewrittenText);
   } finally {
     server.close();
+  }
+});
+
+test("HMAC-SHA256 passcode issuance, verification, tamper rejection, and cross-device recovery", async () => {
+  const secret = "test_secret_key_for_detone_hmac_2026_0123456789";
+  const paidUid = "u_0123456789abcdef01234567";
+  const unpaidUid = "u_fedcba9876543210fedcba98";
+
+  // Unit verification of passcode helper
+  const code = issuePasscode(paidUid, secret);
+  assert.match(code, /^DTN-[0-9A-F]{8}-[0-9A-F]{8}-[0-9A-F]{8}-[0-9A-F]{12}$/);
+  assert.deepEqual(verifyPasscode(code.toLowerCase().replace(/-/g, ""), secret), {
+    valid: true,
+    userId: paidUid,
+    passcode: code
+  });
+  const tampered = code.slice(0, -1) + (code.endsWith("A") ? "B" : "A");
+  assert.equal(verifyPasscode(tampered, secret).valid, false);
+  assert.equal(verifyPasscode(code, "").valid, false);
+
+  const paidUsers = new Set([paidUid]);
+  const fakeWatcha = {
+    isConfigured: () => true,
+    async checkAccess({ userId }) {
+      if (paidUsers.has(userId)) {
+        return { ok: true, access: "granted", entitlement: { type: "permanent" }, purchase: null };
+      }
+      return {
+        ok: true,
+        access: "purchase_required",
+        entitlement: { type: "permanent" },
+        purchase: { url: "https://pay.watcha.cn/checkout/mock" }
+      };
+    }
+  };
+
+  const app = createApp({ watchaClient: fakeWatcha, sessionSecret: secret });
+  const server = await new Promise((resolve) => {
+    const s = app.listen(0, () => resolve(s));
+  });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    // 1. Forged passcode -> 400 and no Set-Cookie
+    const badRes = await fetch(`${base}/api/entitlement/recover`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passcode: tampered })
+    });
+    assert.equal(badRes.status, 400);
+    assert.equal(badRes.headers.get("set-cookie"), null);
+
+    // 2. Valid HMAC but unpaid user -> 403 and no Set-Cookie
+    const unpaidCode = issuePasscode(unpaidUid, secret);
+    const unpaidRes = await fetch(`${base}/api/entitlement/recover`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passcode: unpaidCode })
+    });
+    assert.equal(unpaidRes.status, 403);
+    assert.equal(unpaidRes.headers.get("set-cookie"), null);
+
+    // 3. Valid HMAC + paid user -> 200 + 1-year HttpOnly cookie
+    const okRes = await fetch(`${base}/api/entitlement/recover`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passcode: code })
+    });
+    assert.equal(okRes.status, 200);
+    const okData = await okRes.json();
+    assert.equal(okData.recovered, true);
+    assert.equal(okData.passcode, code);
+    const setCookie = okRes.headers.get("set-cookie") || "";
+    assert.ok(setCookie.includes(`detone_uid=${paidUid}`));
+    assert.ok(setCookie.includes("HttpOnly"));
+    assert.ok(setCookie.includes("Max-Age=31536000"));
+  } finally {
+    server.close();
+  }
+});
+
+test("Cloudflare Worker runtime parity: HMAC passcode, fail-closed recovery, and 1-year Secure cookie", async () => {
+  const path = require("node:path");
+  const { pathToFileURL } = require("node:url");
+  const workerMod = await import(pathToFileURL(path.join(__dirname, "..", "worker", "index.js")).href);
+  const worker = workerMod.default;
+
+  const secret = "worker_parity_secret_2026_abcdef0123456789";
+  const paidUid = "u_aabbccddeeff001122334455";
+  const unpaidUid = "u_554433221100ffeeddccbbaa";
+  const expectedPasscode = issuePasscode(paidUid, secret);
+  const unpaidPasscode = issuePasscode(unpaidUid, secret);
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes("/v1/entitlements/access")) {
+      const payload = JSON.parse(init.body);
+      const granted = payload.user_id === paidUid;
+      return new Response(
+        JSON.stringify(
+          granted
+            ? { access: "granted", entitlement: { type: "permanent" } }
+            : { access: "purchase_required", purchase: { url: "https://pay.watcha.cn/checkout/live" } }
+        ),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    return origFetch(url, init);
+  };
+
+  try {
+    const env = {
+      WATCHA_BASE_URL: "https://pay.watcha.cn",
+      WATCHA_API_KEY: "key_mock",
+      WATCHA_ENTITLEMENT_ID: "ent_mock",
+      SESSION_SECRET: secret
+    };
+
+    // 1. Health reports passcodeRecoveryEnabled: true
+    const hRes = await worker.fetch(new Request("https://detone.doaipm.com/api/health"), env);
+    const hData = await hRes.json();
+    assert.equal(hData.passcodeRecoveryEnabled, true);
+    assert.ok((hRes.headers.get("Set-Cookie") || "").includes("Max-Age=31536000"));
+
+    // 2. Paid user gets identical passcode from Worker as Node passcode.js
+    const stRes = await worker.fetch(
+      new Request("https://detone.doaipm.com/api/entitlement/status", {
+        headers: { Cookie: `detone_uid=${paidUid}` }
+      }),
+      env
+    );
+    const stData = await stRes.json();
+    assert.equal(stData.access, "granted");
+    assert.equal(stData.passcode, expectedPasscode);
+
+    // 3. Forged passcode rejected with 400
+    const badRes = await worker.fetch(
+      new Request("https://detone.doaipm.com/api/entitlement/recover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ passcode: "DTN-00000000-00000000-00000000-1234567890AB" })
+      }),
+      env
+    );
+    assert.equal(badRes.status, 400);
+
+    // 4. Valid HMAC but unpaid user rejected with 403
+    const unpRes = await worker.fetch(
+      new Request("https://detone.doaipm.com/api/entitlement/recover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ passcode: unpaidPasscode })
+      }),
+      env
+    );
+    assert.equal(unpRes.status, 403);
+
+    // 5. Valid paid passcode recovers on fresh device with Secure HttpOnly 1-year cookie
+    const recRes = await worker.fetch(
+      new Request("https://detone.doaipm.com/api/entitlement/recover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ passcode: expectedPasscode })
+      }),
+      env
+    );
+    assert.equal(recRes.status, 200);
+    const recData = await recRes.json();
+    assert.equal(recData.recovered, true);
+    assert.equal(recData.passcode, expectedPasscode);
+    const recCookie = recRes.headers.get("Set-Cookie") || "";
+    assert.ok(recCookie.includes(`detone_uid=${paidUid}`));
+    assert.ok(recCookie.includes("HttpOnly"));
+    assert.ok(recCookie.includes("Secure"));
+    assert.ok(recCookie.includes("Max-Age=31536000"));
+
+    // 6. Missing SESSION_SECRET fails closed with 503
+    const noSecretRes = await worker.fetch(
+      new Request("https://detone.doaipm.com/api/entitlement/recover", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ passcode: expectedPasscode })
+      }),
+      { ...env, SESSION_SECRET: "" }
+    );
+    assert.equal(noSecretRes.status, 503);
+  } finally {
+    globalThis.fetch = origFetch;
   }
 });

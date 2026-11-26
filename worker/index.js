@@ -1,5 +1,10 @@
 // Cloudflare Worker entry for DeTone Studio (Live Alipay Vibe Pay via WatchaPay)
-// Zero external dependencies, stateless edge-native, fail-closed entitlement verification.
+// Zero external dependencies, stateless edge-native, fail-closed entitlement verification,
+// and HMAC-SHA256 signed permanent passcode cross-device recovery.
+
+const COOKIE_MAX_AGE_SECONDS = 31536000; // 1 year
+const PASSCODE_DOMAIN = "detone:passcode:v1:";
+const USER_ID_RE = /^u_([0-9a-f]{24})$/i;
 
 const A_TIER_PATTERNS = [
   { term: "值得注意的是", replace: "其实", tip: "删除翻译腔过渡词，直接说事实" },
@@ -136,22 +141,89 @@ function toFreePreview(full) {
   };
 }
 
+function buildUserCookie(userId) {
+  return `detone_uid=${userId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE_SECONDS}`;
+}
+
 function getOrCreateUserId(request) {
   const cookie = request.headers.get("Cookie") || "";
-  const m = cookie.match(/(?:^|;\s*)detone_uid=([a-zA-Z0-9_-]{12,64})/);
-  if (m) return { userId: m[1], setCookie: null };
+  const m = cookie.match(/(?:^|;\s*)detone_uid=(u_[0-9a-f]{24})(?:$|;)/i);
+  if (m) return { userId: m[1].toLowerCase(), setCookie: null };
   const bytes = new Uint8Array(12);
   crypto.getRandomValues(bytes);
   const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
   const userId = "u_" + hex;
   return {
     userId,
-    setCookie: `detone_uid=${userId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000`
+    setCookie: buildUserCookie(userId)
+  };
+}
+
+function formatPasscode(rawHex24, sigHex12) {
+  const h = rawHex24.toUpperCase();
+  const s = sigHex12.toUpperCase();
+  return `DTN-${h.slice(0, 8)}-${h.slice(8, 16)}-${h.slice(16, 24)}-${s}`;
+}
+
+function constantTimeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+async function computeHmacHex12(userId, secret) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(String(secret)),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sigBuf = await crypto.subtle.sign("HMAC", key, enc.encode(`${PASSCODE_DOMAIN}${userId.toLowerCase()}`));
+  const bytes = new Uint8Array(sigBuf);
+  return Array.from(bytes.slice(0, 6), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function hasSessionSecret(env) {
+  return Boolean(env && env.SESSION_SECRET && String(env.SESSION_SECRET).trim().length >= 16);
+}
+
+async function issuePasscode(userId, env) {
+  if (!hasSessionSecret(env)) return null;
+  const m = String(userId || "").match(USER_ID_RE);
+  if (!m) return null;
+  const normalizedUid = `u_${m[1].toLowerCase()}`;
+  const sigHex12 = await computeHmacHex12(normalizedUid, env.SESSION_SECRET);
+  return formatPasscode(m[1], sigHex12);
+}
+
+async function verifyPasscode(input, env) {
+  if (!hasSessionSecret(env)) return { valid: false, reason: "secret_not_configured" };
+  const cleaned = String(input || "").trim().toUpperCase();
+  const body = cleaned.replace(/^DTN-?/, "").replace(/[\s-]+/g, "");
+  if (!/^[0-9A-F]{36}$/.test(body)) {
+    return { valid: false, reason: "invalid_format" };
+  }
+  const rawHex24 = body.slice(0, 24).toLowerCase();
+  const providedSig = body.slice(24, 36).toLowerCase();
+  const userId = `u_${rawHex24}`;
+  const expectedSig = await computeHmacHex12(userId, env.SESSION_SECRET);
+  if (!constantTimeEqual(providedSig, expectedSig)) {
+    return { valid: false, reason: "invalid_signature" };
+  }
+  return {
+    valid: true,
+    userId,
+    passcode: formatPasscode(rawHex24, expectedSig)
   };
 }
 
 function jsonResp(data, status = 200, setCookie = null) {
-  const headers = { "Content-Type": "application/json; charset=utf-8" };
+  const headers = { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" };
   if (setCookie) headers["Set-Cookie"] = setCookie;
   return new Response(JSON.stringify(data), { status, headers });
 }
@@ -186,9 +258,21 @@ const HTML_PAGE = `<!DOCTYPE html>
     :root{--bg:#080d1a;--card:#111a2e;--card-2:#17233d;--border:#25355a;--text:#eef3ff;--muted:#93a6ce;--cyan:#38bdf8;--ok:#34d399;--warn:#fbbf24;--danger:#f87171}
     *{box-sizing:border-box}
     body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:radial-gradient(circle at top right,#122146 0%,var(--bg) 55%);color:var(--text);min-height:100vh}
-    header{border-bottom:1px solid var(--border);background:rgba(8,13,26,.9);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+    header{border-bottom:1px solid var(--border);background:rgba(8,13,26,.92);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
     .logo h1{margin:0;font-size:19px}.logo p{margin:3px 0 0;font-size:12.5px;color:var(--muted)}
+    .header-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
     .badge{padding:6px 12px;border-radius:999px;font-size:12px;border:1px solid #1d4ed8;background:rgba(22,119,255,.16);color:#93c5fd}
+    .badge.pro{border-color:var(--ok);background:rgba(52,211,153,.16);color:#a7f3d0}
+    .btn-ghost{padding:6px 12px;border-radius:999px;font-size:12px;border:1px solid var(--border);background:var(--card-2);color:#cbd5e1;cursor:pointer;font-weight:600}
+    .btn-ghost:hover{border-color:var(--cyan);color:#fff}
+    .top-drawer{max-width:1220px;margin:14px auto 0;padding:0 20px;display:none}
+    .drawer-box{background:var(--card);border:1px solid var(--cyan);border-radius:14px;padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+    .drawer-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    .drawer-box input{flex:1;min-width:260px;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:#0a1020;color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13.5px;letter-spacing:.4px}
+    .drawer-box input:focus{outline:none;border-color:var(--cyan)}
+    .passcode-bar{max-width:1220px;margin:14px auto 0;padding:0 20px;display:none}
+    .passcode-card{background:linear-gradient(135deg,rgba(16,185,129,.14),rgba(56,189,248,.10));border:1px solid var(--ok);border-radius:14px;padding:14px 16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+    .passcode-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:14px;font-weight:700;color:#ecfdf5;background:rgba(8,13,26,.7);border:1px solid rgba(52,211,153,.45);padding:6px 12px;border-radius:8px;letter-spacing:.6px;user-select:all}
     .container{max-width:1220px;margin:0 auto;padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:18px}
     @media(max-width:900px){.container{grid-template-columns:1fr}}
     .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px;display:flex;flex-direction:column;gap:14px}
@@ -221,10 +305,40 @@ const HTML_PAGE = `<!DOCTYPE html>
   <header>
     <div class="logo">
       <h1>DeTone Studio · 文章去 AI 味三层体检精修台</h1>
-      <p>确定性 A/B/C 三层中文去腔扫描 · 已接入支付宝 Vibe Pay（即刻收永久买断）</p>
+      <p>确定性 A/B/C 三层中文去腔扫描 · 支付宝 Vibe Pay 永久买断（免注册 · 通行码跨设备恢复）</p>
     </div>
-    <div class="badge" id="modeBadge">支付宝 Vibe Pay 正式收款已就绪</div>
+    <div class="header-actions">
+      <button class="btn-ghost" id="btnToggleRecover" type="button">已有通行码？恢复永久权益</button>
+      <div class="badge" id="modeBadge">支付宝 Vibe Pay 正式收款已就绪</div>
+    </div>
   </header>
+
+  <section class="top-drawer" id="recoverDrawer">
+    <div class="drawer-box">
+      <div style="font-size:13.5px;font-weight:600;color:#bae6fd;">跨设备 / 清缓存恢复永久专业版权益</div>
+      <div style="font-size:12.5px;color:#93a6ce;">输入买断后获得的防伪通行码（服务端将校验 HMAC 签名并实时向支付宝 Vibe Pay 复核买断权益）：</div>
+      <div class="drawer-row">
+        <input id="passcodeInput" type="text" placeholder="粘贴永久通行码，例如 DTN-XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXXXXXX" autocomplete="off" spellcheck="false">
+        <button class="primary" id="btnRecoverSubmit" type="button">验证并恢复权益</button>
+        <button id="btnRecoverClose" type="button">收起</button>
+      </div>
+      <div id="recoverMsg" style="font-size:12.5px;color:#93a6ce;"></div>
+    </div>
+  </section>
+
+  <section class="passcode-bar" id="passcodeBar">
+    <div class="passcode-card">
+      <div>
+        <div style="font-size:13.5px;font-weight:700;color:#a7f3d0;">永久专业版通行证（已为本浏览器保存 1 年免登凭证）</div>
+        <div style="font-size:12px;color:#cbd5e1;margin-top:3px;">换设备或清理浏览器缓存后，凭此防伪通行码可一键恢复永久买断权益，请复制妥善保存。</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+        <span class="passcode-code" id="passcodeText"></span>
+        <button class="primary" id="btnCopyPasscode" type="button" style="padding:8px 14px;font-size:12.5px;">复制通行码</button>
+      </div>
+    </div>
+  </section>
+
   <main class="container">
     <section class="card">
       <h2><span>1. 粘贴待体检中文文章</span><button id="btnSample" type="button">填入典型 AI 味样稿</button></h2>
@@ -240,7 +354,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       <div id="emptyHint" style="color:#93a6ce;font-size:13.5px;line-height:1.7;">
         • <strong>A 级机械套话层</strong>：识别“值得注意的是、综上所述、赋能、抓手、形成闭环”等 20+ 高频黑话；<br>
         • <strong>B 级结构指纹层</strong>：检测结论冒号轰炸、破折号译制腔、三连排比与“不是…而是…”模板；<br>
-        • <strong>C 级逐句精修层</strong>：一次支付宝永久买断，解锁全部逐句改写对照与 Markdown 报告下载。
+        • <strong>C 级逐句精修层</strong>：一次支付宝永久买断，自动生成防伪通行码，支持换设备恢复与 Markdown 导出。
       </div>
       <div id="reportBody" style="display:none;flex-direction:column;gap:14px;">
         <div class="kpi-grid">
@@ -254,8 +368,8 @@ const HTML_PAGE = `<!DOCTYPE html>
         <div><div style="font-size:13px;font-weight:600;margin-bottom:8px;">B 级结构指纹诊断</div><div id="bHitsList" style="display:flex;flex-direction:column;gap:8px;"></div></div>
         <div><div style="font-size:13px;font-weight:600;margin-bottom:8px;">逐句诊断与人味改写对照</div><div id="diagList" style="display:flex;flex-direction:column;gap:8px;"></div></div>
         <div class="paywall" id="paywallBox">
-          <h3>支付宝永久买断 · 解锁全篇精修与 Markdown 导出</h3>
-          <p id="paywallDesc">通过支付宝 Vibe Pay（即刻收）完成一次买断，即可永久解锁全部逐句改写建议、完整自然润色稿与报告下载。</p>
+          <h3>支付宝永久买断 · 解锁全篇精修与防伪通行码</h3>
+          <p id="paywallDesc">通过支付宝 Vibe Pay（即刻收）完成一次买断，本机 1 年免登自动解锁，并立即生成专属防伪通行码，换电脑/手机也能一键恢复永久权益。</p>
           <button class="pay" id="btnPay" type="button">支付宝扫码 / 跳转付款，永久解锁专业版</button>
           <div class="qr-box" id="qrBox">
             <img id="qrImg" alt="支付宝收款码">
@@ -265,7 +379,7 @@ const HTML_PAGE = `<!DOCTYPE html>
           </div>
         </div>
         <div id="unlockedArea" style="display:none;flex-direction:column;gap:10px;">
-          <div class="unlocked-banner">支付宝 Vibe Pay 永久专业版权益已核验！已解锁全部逐句精修与完整改写稿。</div>
+          <div class="unlocked-banner">支付宝 Vibe Pay 永久专业版权益已核验！已解锁全部逐句精修与完整改写稿（上方可复制您的永久通行码）。</div>
           <div style="display:flex;justify-content:space-between;align-items:center;">
             <strong style="font-size:13.5px;">完整去 AI 味参考改写稿</strong>
             <button id="btnDownload" type="button">下载 Markdown 完整报告</button>
@@ -278,10 +392,22 @@ const HTML_PAGE = `<!DOCTYPE html>
   <script>
     const SAMPLE = "随着人工智能的飞速发展，内容创作行业正在经历前所未有的变革。值得注意的是，越来越多的创作者开始依赖大模型生成文章，这无疑是一把双刃剑。\\n\\n首先，AI 写作不仅大幅提升了生产效率，而且降低了创作门槛。其次，不可否认的是，过度依赖模板会导致文章同质化严重——读者一眼就能看出浓重的机器腔调。最后，从某种意义上说，真正拉开差距的不是工具本身，而是创作者的真实思考。\\n\\n核心结论：要让内容重新获得信任，我们需要打造差异化抓手，赋能个人表达，并形成闭环。换言之，去 AI 味不是简单的同义词替换，而是回到真实人话。综上所述，毫无疑问，保持独立视角才是最重要的护城河。";
     let currentFull = null;
+    let currentPasscode = "";
     const savedDraft = sessionStorage.getItem("detone_draft");
     if (savedDraft) document.getElementById("articleInput").value = savedDraft;
 
-    function renderReport(report, isUnlocked) {
+    function showProStatus(passcode) {
+      const badge = document.getElementById("modeBadge");
+      badge.textContent = "永久专业版已激活";
+      badge.className = "badge pro";
+      if (passcode) {
+        currentPasscode = passcode;
+        document.getElementById("passcodeText").textContent = passcode;
+        document.getElementById("passcodeBar").style.display = "block";
+      }
+    }
+
+    function renderReport(report, isUnlocked, passcode) {
       document.getElementById("emptyHint").style.display = "none";
       document.getElementById("reportBody").style.display = "flex";
       const sEl = document.getElementById("kScore");
@@ -303,6 +429,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         : '<div style="color:#86efac;font-size:13px;">当前段落无高危病句。</div>';
       if (isUnlocked) {
         currentFull = report;
+        showProStatus(passcode || currentPasscode);
         document.getElementById("paywallBox").style.display = "none";
         document.getElementById("unlockedArea").style.display = "flex";
         document.getElementById("rewriteBox").textContent = report.rewrittenText;
@@ -310,6 +437,16 @@ const HTML_PAGE = `<!DOCTYPE html>
         document.getElementById("paywallBox").style.display = "block";
         document.getElementById("unlockedArea").style.display = "none";
       }
+    }
+
+    async function checkInitialStatus() {
+      try {
+        const res = await fetch("/api/entitlement/status");
+        const data = await res.json();
+        if (res.ok && data.access === "granted") {
+          showProStatus(data.passcode);
+        }
+      } catch (_e) {}
     }
 
     async function runAnalyze() {
@@ -322,9 +459,9 @@ const HTML_PAGE = `<!DOCTYPE html>
       if (!res.ok) { document.getElementById("statusMsg").textContent = data.error || "扫描失败"; return; }
       if (data.unlocked && data.fullReport) {
         document.getElementById("statusMsg").textContent = "已核验永久专业版权益，直接展示完整精修报告！";
-        renderReport(data.fullReport, true);
+        renderReport(data.fullReport, true, data.passcode);
       } else {
-        document.getElementById("statusMsg").textContent = "免费初检完成！付费永久买断后立即解锁全篇逐句精修与导出。";
+        document.getElementById("statusMsg").textContent = "免费初检完成！付费永久买断后立即解锁全篇逐句精修与防伪通行码。";
         renderReport(data.preview, false);
       }
     }
@@ -336,7 +473,11 @@ const HTML_PAGE = `<!DOCTYPE html>
         const res = await fetch("/api/checkout", { method: "POST" });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "获取购买入口失败");
-        if (data.access === "granted") { await runAnalyze(); return; }
+        if (data.access === "granted") {
+          showProStatus(data.passcode);
+          await runAnalyze();
+          return;
+        }
         if (data.qrCodeUrl) {
           document.getElementById("qrImg").src = data.qrCodeUrl;
           document.getElementById("payDirectLink").href = data.payUrl;
@@ -351,11 +492,81 @@ const HTML_PAGE = `<!DOCTYPE html>
       }
     }
 
+    async function submitRecover() {
+      const input = document.getElementById("passcodeInput").value.trim();
+      const msg = document.getElementById("recoverMsg");
+      if (!input) { msg.style.color = "#f87171"; msg.textContent = "请先粘贴您的永久通行码。"; return; }
+      const btn = document.getElementById("btnRecoverSubmit");
+      btn.disabled = true;
+      msg.style.color = "#93a6ce";
+      msg.textContent = "正在校验 HMAC 防伪签名并实时核验支付宝买断权益…";
+      try {
+        const res = await fetch("/api/entitlement/recover", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ passcode: input })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          msg.style.color = "#f87171";
+          msg.textContent = data.error || "恢复失败，请确认通行码正确且已完成买断。";
+          return;
+        }
+        msg.style.color = "#34d399";
+        msg.textContent = "校验通过！已为当前浏览器恢复 1 年免登永久专业版权益。";
+        showProStatus(data.passcode);
+        document.getElementById("recoverDrawer").style.display = "none";
+        if (document.getElementById("articleInput").value.trim().length >= 30) {
+          await runAnalyze();
+        }
+      } catch (_e) {
+        msg.style.color = "#f87171";
+        msg.textContent = "网络请求异常，请稍后重试。";
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    document.getElementById("btnToggleRecover").addEventListener("click", () => {
+      const d = document.getElementById("recoverDrawer");
+      d.style.display = d.style.display === "block" ? "none" : "block";
+      if (d.style.display === "block") document.getElementById("passcodeInput").focus();
+    });
+    document.getElementById("btnRecoverClose").addEventListener("click", () => {
+      document.getElementById("recoverDrawer").style.display = "none";
+    });
+    document.getElementById("btnRecoverSubmit").addEventListener("click", submitRecover);
+    document.getElementById("passcodeInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") submitRecover();
+    });
+    document.getElementById("btnCopyPasscode").addEventListener("click", async () => {
+      if (!currentPasscode) return;
+      const btn = document.getElementById("btnCopyPasscode");
+      try {
+        await navigator.clipboard.writeText(currentPasscode);
+      } catch (_e) {
+        const ta = document.createElement("textarea");
+        ta.value = currentPasscode;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      btn.textContent = "已复制到剪贴板！";
+      setTimeout(() => { btn.textContent = "复制通行码"; }, 2200);
+    });
+
     document.getElementById("btnSample").addEventListener("click", () => { document.getElementById("articleInput").value = SAMPLE; });
     document.getElementById("btnAnalyze").addEventListener("click", runAnalyze);
-    document.getElementById("btnRecheck").addEventListener("click", runAnalyze);
+    document.getElementById("btnRecheck").addEventListener("click", async () => {
+      await checkInitialStatus();
+      if (document.getElementById("articleInput").value.trim().length >= 30) await runAnalyze();
+    });
     document.getElementById("btnPay").addEventListener("click", startPay);
-    document.getElementById("btnAfterQr").addEventListener("click", runAnalyze);
+    document.getElementById("btnAfterQr").addEventListener("click", async () => {
+      await checkInitialStatus();
+      await runAnalyze();
+    });
     document.getElementById("btnDownload").addEventListener("click", () => {
       if (!currentFull) return;
       const r = currentFull;
@@ -365,6 +576,8 @@ const HTML_PAGE = `<!DOCTYPE html>
       a.download = "detone-studio-report.md";
       a.click();
     });
+
+    checkInitialStatus();
     if (new URLSearchParams(location.search).get("check_entitlement") && savedDraft) runAnalyze();
   </script>
 </body>
@@ -375,6 +588,7 @@ export default {
     const url = new URL(request.url);
     const { userId, setCookie } = getOrCreateUserId(request);
     const configured = Boolean(env.WATCHA_API_KEY && env.WATCHA_ENTITLEMENT_ID);
+    const passcodeRecoveryEnabled = hasSessionSecret(env);
 
     if (request.method === "GET" && url.pathname === "/") {
       const headers = { "Content-Type": "text/html; charset=utf-8" };
@@ -388,8 +602,52 @@ export default {
         product: "DeTone Studio · 文章去 AI 味三层体检精修台",
         runtime: "cloudflare-workers",
         paymentMode: configured ? "watchapay-vibe-pay-live" : "unconfigured",
-        watchaConfigured: configured
+        watchaConfigured: configured,
+        passcodeRecoveryEnabled
       }, 200, setCookie);
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/entitlement/status") {
+      if (!configured) {
+        return jsonResp({ access: "unavailable", error: "服务端支付凭证未配置。" }, 503, setCookie);
+      }
+      const acc = await checkWatchaAccess(env, userId, `${url.origin}/?check_entitlement=1`);
+      if (!acc.ok || acc.access === "unavailable") {
+        return jsonResp({ access: "unavailable", reason: acc.reason }, 503, setCookie);
+      }
+      if (acc.access === "granted") {
+        const passcode = await issuePasscode(userId, env);
+        return jsonResp({ access: "granted", entitlement: acc.entitlement, passcode }, 200, setCookie);
+      }
+      return jsonResp({ access: "purchase_required" }, 200, setCookie);
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/entitlement/recover") {
+      if (!configured || !passcodeRecoveryEnabled) {
+        return jsonResp({ error: "服务端通行码恢复功能暂未就绪（失败关闭保护）。" }, 503, setCookie);
+      }
+      const body = await request.json().catch(() => ({}));
+      const verified = await verifyPasscode(body.passcode, env);
+      if (!verified.valid) {
+        return jsonResp({ error: "通行码格式错误或防伪签名校验失败，请确认是否完整复制。" }, 400, setCookie);
+      }
+      const acc = await checkWatchaAccess(env, verified.userId, `${url.origin}/?check_entitlement=1`);
+      if (!acc.ok || acc.access === "unavailable") {
+        return jsonResp({ error: "支付宝 Vibe Pay 权益核验服务暂不可用，请稍后重试。", reason: acc.reason }, 503, setCookie);
+      }
+      if (acc.access !== "granted") {
+        return jsonResp({ error: "该通行码尚未检测到有效买断权益，请确认是否已完成支付宝付款。" }, 403, setCookie);
+      }
+      return jsonResp(
+        {
+          recovered: true,
+          access: "granted",
+          passcode: verified.passcode,
+          entitlement: acc.entitlement
+        },
+        200,
+        buildUserCookie(verified.userId)
+      );
     }
 
     if (request.method === "POST" && url.pathname === "/api/analyze") {
@@ -398,12 +656,16 @@ export default {
       if (text.length < 30) return jsonResp({ error: "请粘贴至少 30 字的中文文章内容。" }, 400, setCookie);
       const full = analyzeArticle(text);
       let unlocked = false;
+      let passcode = null;
       if (configured) {
         const acc = await checkWatchaAccess(env, userId, `${url.origin}/?check_entitlement=1`);
-        if (acc.ok && acc.access === "granted") unlocked = true;
+        if (acc.ok && acc.access === "granted") {
+          unlocked = true;
+          passcode = await issuePasscode(userId, env);
+        }
       }
       return jsonResp(
-        unlocked ? { unlocked: true, fullReport: full } : { unlocked: false, preview: toFreePreview(full) },
+        unlocked ? { unlocked: true, passcode, fullReport: full } : { unlocked: false, preview: toFreePreview(full) },
         200,
         setCookie
       );
@@ -416,7 +678,8 @@ export default {
         return jsonResp({ error: "支付宝 Vibe Pay 权益服务暂不可用，请稍后重试。", reason: acc.reason }, 503, setCookie);
       }
       if (acc.access === "granted") {
-        return jsonResp({ access: "granted", entitlement: acc.entitlement }, 200, setCookie);
+        const passcode = await issuePasscode(userId, env);
+        return jsonResp({ access: "granted", passcode, entitlement: acc.entitlement }, 200, setCookie);
       }
       if (!acc.purchase || !acc.purchase.url) {
         return jsonResp({ error: "当前商品暂无可用购买入口。" }, 503, setCookie);

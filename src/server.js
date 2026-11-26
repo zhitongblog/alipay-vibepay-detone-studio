@@ -23,6 +23,9 @@ const express = require("express");
 const { analyzeArticle, toFreePreview } = require("./analyzer");
 const { AlipayWebPayClient } = require("./alipay-client");
 const { WatchaPayClient } = require("./watchapay-client");
+const { issuePasscode, verifyPasscode } = require("./passcode");
+
+const COOKIE_MAX_AGE_SECONDS = 31536000; // 1 year
 
 const PLANS = {
   single_unlock: {
@@ -45,19 +48,25 @@ function createApp(options = {}) {
   const app = express();
   const alipay = options.alipayClient || new AlipayWebPayClient(options.alipayConfig);
   const watcha = options.watchaClient || new WatchaPayClient(options.watchaConfig);
+  const sessionSecret = options.sessionSecret !== undefined ? options.sessionSecret : (process.env.SESSION_SECRET || "");
+  const passcodeRecoveryEnabled = Boolean(sessionSecret && String(sessionSecret).trim().length >= 16);
   const publicBaseUrl = (options.publicBaseUrl || process.env.PUBLIC_BASE_URL || "http://127.0.0.1:3088").replace(/\/+$/, "");
 
   // In-memory store (persists for process lifetime; easily swappable to SQLite/Redis)
   const reports = new Map();
   const orders = new Map();
 
+  function buildUserCookie(uid) {
+    return `detone_uid=${uid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE_SECONDS}`;
+  }
+
   // Stable server-issued user identity cookie (never trusts arbitrary client user_id)
   function getOrCreateUserId(req, res) {
     const cookieHeader = String(req.headers.cookie || "");
-    const m = cookieHeader.match(/(?:^|;\s*)detone_uid=([a-zA-Z0-9_-]{12,64})/);
-    if (m) return m[1];
+    const m = cookieHeader.match(/(?:^|;\s*)detone_uid=(u_[0-9a-f]{24})(?:$|;)/i);
+    if (m) return m[1].toLowerCase();
     const uid = "u_" + crypto.randomBytes(12).toString("hex");
-    res.setHeader("Set-Cookie", `detone_uid=${uid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
+    res.setHeader("Set-Cookie", buildUserCookie(uid));
     return uid;
   }
 
@@ -75,8 +84,54 @@ function createApp(options = {}) {
       paymentMode,
       watchaConfigured: watcha.isConfigured(),
       alipayConfigured: alipay.isConfigured(),
+      passcodeRecoveryEnabled,
       notifyUrlConfigured: Boolean(alipay.notifyUrl),
       plans: PLANS
+    });
+  });
+
+  // 爱猹收（Vibe Pay 个人即刻收）当前浏览器权益状态查询（含防伪通行码）
+  app.get("/api/entitlement/status", async (req, res) => {
+    const userId = getOrCreateUserId(req, res);
+    if (!watcha.isConfigured()) {
+      return res.status(503).json({ access: "unavailable", error: "WatchaPay 未配置。" });
+    }
+    const result = await watcha.checkAccess({ userId, returnUrl: `${publicBaseUrl}/?check_entitlement=1` });
+    if (!result.ok || result.access === "unavailable") {
+      return res.status(503).json({ access: "unavailable", reason: result.reason });
+    }
+    if (result.access === "granted") {
+      const passcode = issuePasscode(userId, sessionSecret);
+      return res.json({ access: "granted", entitlement: result.entitlement, passcode });
+    }
+    return res.json({ access: "purchase_required" });
+  });
+
+  // 跨设备通行码恢复：先验 HMAC-SHA256 签名，再实时复核 WatchaPay 买断权益，双重通过才切换 Cookie
+  app.post("/api/entitlement/recover", async (req, res) => {
+    if (!watcha.isConfigured() || !passcodeRecoveryEnabled) {
+      return res.status(503).json({ error: "服务端通行码恢复功能暂未就绪（失败关闭保护）。" });
+    }
+    const verified = verifyPasscode(req.body?.passcode, sessionSecret);
+    if (!verified.valid) {
+      return res.status(400).json({ error: "通行码格式错误或防伪签名校验失败，请确认是否完整复制。" });
+    }
+    const result = await watcha.checkAccess({
+      userId: verified.userId,
+      returnUrl: `${publicBaseUrl}/?check_entitlement=1`
+    });
+    if (!result.ok || result.access === "unavailable") {
+      return res.status(503).json({ error: "支付权益核验服务暂不可用，请稍后重试。", reason: result.reason });
+    }
+    if (result.access !== "granted") {
+      return res.status(403).json({ error: "该通行码尚未检测到有效买断权益，请确认是否已完成支付宝付款。" });
+    }
+    res.setHeader("Set-Cookie", buildUserCookie(verified.userId));
+    return res.json({
+      recovered: true,
+      access: "granted",
+      passcode: verified.passcode,
+      entitlement: result.entitlement
     });
   });
 
@@ -104,8 +159,10 @@ function createApp(options = {}) {
 
     if (result.access === "granted") {
       if (rec) rec.unlocked = true;
+      const passcode = issuePasscode(userId, sessionSecret);
       return res.json({
         access: "granted",
+        passcode,
         entitlement: result.entitlement,
         fullReport: rec ? rec.full : null
       });
@@ -165,6 +222,7 @@ function createApp(options = {}) {
         return res.json({
           mode: "watchapay-vibe-pay",
           alreadyGranted: true,
+          passcode: issuePasscode(userId, sessionSecret),
           fullReport: record.full
         });
       }
