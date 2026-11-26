@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DeTone Studio｜文章去 AI 味三层体检与精修工作台（支付宝 Vibe Pay）</title>
+  <style>
+    :root {
+      --bg: #080d1a;
+      --card: #111a2e;
+      --card-2: #17233d;
+      --border: #25355a;
+      --text: #eef3ff;
+      --muted: #93a6ce;
+      --brand: #1677ff;
+      --cyan: #38bdf8;
+      --ok: #34d399;
+      --warn: #fbbf24;
+      --danger: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at top right, #122146 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      border-bottom: 1px solid var(--border);
+      background: rgba(8, 13, 26, 0.88);
+      backdrop-filter: blur(8px);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .logo h1 { margin: 0; font-size: 19px; }
+    .logo p { margin: 3px 0 0; font-size: 12.5px; color: var(--muted); }
+    .badge {
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      border: 1px solid #1d4ed8;
+      background: rgba(22, 119, 255, 0.16);
+      color: #93c5fd;
+    }
+    .container {
+      max-width: 1220px;
+      margin: 0 auto;
+      padding: 20px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+    @media (max-width: 900px) { .container { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .card h2 { margin: 0; font-size: 15px; display: flex; justify-content: space-between; align-items: center; }
+    textarea {
+      width: 100%;
+      min-height: 320px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #0a1020;
+      color: var(--text);
+      padding: 14px;
+      font-size: 14px;
+      line-height: 1.7;
+      resize: vertical;
+      font-family: inherit;
+    }
+    textarea:focus { outline: none; border-color: var(--cyan); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; }
+    button {
+      padding: 11px 18px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--card-2);
+      color: var(--text);
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.primary { background: linear-gradient(135deg, #1677ff, #2563eb); border-color: #3b82f6; }
+    button.pay { background: linear-gradient(135deg, #0ea5e9, #1677ff); border-color: #38bdf8; width: 100%; padding: 13px; font-size: 15px; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    @media (max-width: 560px) { .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .kpi { background: var(--card-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
+    .kpi span { display: block; font-size: 11px; color: var(--muted); }
+    .kpi strong { display: block; margin-top: 4px; font-size: 20px; color: var(--cyan); }
+    .kpi strong.high { color: var(--danger); }
+    .kpi strong.mid { color: var(--warn); }
+    .kpi strong.low { color: var(--ok); }
+    .pill-list { display: flex; flex-wrap: wrap; gap: 8px; }
+    .hit-pill {
+      padding: 5px 10px;
+      border-radius: 8px;
+      background: rgba(248, 113, 113, 0.14);
+      border: 1px solid rgba(248, 113, 113, 0.45);
+      color: #fecaca;
+      font-size: 12.5px;
+    }
+    .diag-item {
+      border: 1px solid var(--border);
+      background: rgba(15, 23, 42, 0.72);
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 13px;
+      line-height: 1.65;
+    }
+    .diag-item .orig { color: #fca5a5; }
+    .diag-item .rev { color: #86efac; margin-top: 6px; }
+    .paywall {
+      border: 1px dashed #38bdf8;
+      background: linear-gradient(180deg, rgba(22, 119, 255, 0.12), rgba(14, 165, 233, 0.06));
+      border-radius: 12px;
+      padding: 16px;
+    }
+    .paywall h3 { margin: 0 0 6px; font-size: 15px; color: #bae6fd; }
+    .paywall p { margin: 0 0 12px; font-size: 13px; color: var(--muted); line-height: 1.6; }
+    .unlocked-banner {
+      background: rgba(52, 211, 153, 0.14);
+      border: 1px solid var(--ok);
+      color: #a7f3d0;
+      padding: 10px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+    }
+    pre.rewrite-box {
+      white-space: pre-wrap;
+      background: #0a1020;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+      font-family: inherit;
+      font-size: 13.5px;
+      line-height: 1.75;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="logo">
+      <h1>DeTone Studio · 文章去 AI 味三层体检精修台</h1>
+      <p>确定性 A/B/C 三层中文去腔扫描 · 接入支付宝 AI 付 Vibe Pay（alipay.trade.page.pay）</p>
+    </div>
+    <div class="badge" id="modeBadge">加载支付通道中…</div>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>
+        <span>1. 粘贴待体检文章（公众号 / 小红书 / 论文 / 报告）</span>
+        <button id="btnSample" type="button">填入典型 AI 味样稿</button>
+      </h2>
+      <textarea id="articleInput" placeholder="请粘贴至少 30 字中文文章内容，点击「免费三层扫描」立即可见 AI 味指数、A/B 级套话命中与初步诊断…"></textarea>
+      <div class="row">
+        <button class="primary" id="btnAnalyze" type="button">立即免费三层扫描</button>
+        <button id="btnClear" type="button">清空</button>
+      </div>
+      <div id="statusMsg" style="font-size:12.5px;color:#93a6ce;"></div>
+    </section>
+
+    <section class="card" id="resultCard">
+      <h2><span>2. 三层体检报告与精修交付</span><span id="gradeTag" style="font-size:12px;color:#93a6ce;">等待扫描</span></h2>
+      <div id="emptyHint" style="color:#93a6ce;font-size:13.5px;line-height:1.7;">
+        粘贴文章后，系统将从三个维度执行确定性扫描：<br>
+        • <strong>A 级机械套话层</strong>：识别“值得注意的是、综上所述、赋能、抓手、形成闭环”等高频模型黑话；<br>
+        • <strong>B 级结构指纹层</strong>：检测结论冒号轰炸、破折号译制腔、工整排比三连与“不是…而是…”模板句；<br>
+        • <strong>C 级逐句精修层</strong>：定位每一句病灶并产出自然口语改写对照稿（支付宝 ¥1.99 即可解锁全篇导出）。
+      </div>
+
+      <div id="reportBody" style="display:none;flex-direction:column;gap:14px;">
+        <div class="kpi-grid">
+          <div class="kpi"><span>AI 味指数</span><strong id="kScore">0</strong></div>
+          <div class="kpi"><span>A 级套话命中</span><strong id="kAHits">0</strong></div>
+          <div class="kpi"><span>B 级结构指纹</span><strong id="kBIssues">0</strong></div>
+          <div class="kpi"><span>待精修句子</span><strong id="kSentences">0</strong></div>
+        </div>
+
+        <div id="verdictBox" style="font-size:13px;color:#cbd5e1;line-height:1.6;"></div>
+
+        <div>
+          <div style="font-size:13px;font-weight:600;margin-bottom:8px;">A 级高频套话命中</div>
+          <div class="pill-list" id="aHitsList"></div>
+        </div>
+
+        <div id="bHitsSection">
+          <div style="font-size:13px;font-weight:600;margin-bottom:8px;">B 级结构指纹诊断</div>
+          <div id="bHitsList" style="display:flex;flex-direction:column;gap:8px;"></div>
+        </div>
+
+        <div>
+          <div style="font-size:13px;font-weight:600;margin-bottom:8px;">逐句诊断与人味改写对照</div>
+          <div id="diagList" style="display:flex;flex-direction:column;gap:8px;"></div>
+        </div>
+
+        <div class="paywall" id="paywallBox">
+          <h3>解锁全篇深度精修报告 + 一键去 AI 味对照稿</h3>
+          <p id="paywallDesc">免费版已展示前序诊断预览。通过支付宝 Vibe Pay 支付 <strong>¥1.99</strong>，立即解锁全部逐句改写建议、完整润色稿与 Markdown 报告一键下载。</p>
+          <button class="pay" id="btnPay" type="button">支付宝扫码 / 网页支付 ¥1.99 立即解锁</button>
+        </div>
+
+        <div id="unlockedArea" style="display:none;flex-direction:column;gap:10px;">
+          <div class="unlocked-banner" id="unlockedBanner">支付已验证！已解锁全部逐句精修与完整改写稿。</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong style="font-size:13.5px;">完整去 AI 味参考改写稿</strong>
+            <button id="btnDownload" type="button">下载 Markdown 完整报告</button>
+          </div>
+          <pre class="rewrite-box" id="rewriteBox"></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const SAMPLE_TEXT = `随着人工智能的飞速发展，内容创作行业正在经历前所未有的变革。值得注意的是，越来越多的创作者开始依赖大模型生成文章，这无疑是一把双刃剑。\n\n首先，AI 写作不仅大幅提升了生产效率，而且降低了创作门槛。其次，不可否认的是，过度依赖模板会导致文章同质化严重——读者一眼就能看出浓重的机器腔调。最后，从某种意义上说，真正拉开差距的不是工具本身，而是创作者的真实思考。\n\n核心结论：要让内容重新获得信任，我们需要打造差异化抓手，赋能个人表达，并形成闭环。换言之，去 AI 味不是简单的同义词替换，而是回到真实人话。综上所述，毫无疑问，保持独立视角才是最重要的护城河。`;
+
+    let currentReportId = "";
+    let currentFullReport = null;
+
+    async function loadHealth() {
+      const res = await fetch("/api/health");
+      const data = await res.json();
+      const badge = document.getElementById("modeBadge");
+      badge.textContent = data.alipayConfigured
+        ? `支付宝 Vibe Pay 已就绪（${data.paymentMode}）`
+        : "支付宝 Vibe Pay · 本地沙箱演示模式";
+    }
+
+    function renderReport(report, isUnlocked, orderMeta) {
+      document.getElementById("emptyHint").style.display = "none";
+      const body = document.getElementById("reportBody");
+      body.style.display = "flex";
+
+      const scoreEl = document.getElementById("kScore");
+      scoreEl.textContent = report.aiScore + " / 100";
+      scoreEl.className = report.aiScore >= 65 ? "high" : (report.aiScore >= 35 ? "mid" : "low");
+      document.getElementById("kAHits").textContent = report.summary.aTierTotalHits;
+      document.getElementById("kBIssues").textContent = report.summary.bTierIssues;
+      document.getElementById("kSentences").textContent = report.summary.flaggedSentences;
+      document.getElementById("gradeTag").textContent = report.grade;
+      document.getElementById("verdictBox").textContent = `全文字数 ${report.charCount} 字 · 平均句长 ${report.avgSentenceLen} 字 · ${report.verdict}`;
+
+      const aList = document.getElementById("aHitsList");
+      aList.innerHTML = report.aHits.length
+        ? report.aHits.map(h => `<span class="hit-pill">「${h.term}」×${h.count} → 改「${h.replace || "删去"}」</span>`).join("")
+        : `<span style="color:#86efac;font-size:13px;">未检出高频 A 级机械套话</span>`;
+
+      const bList = document.getElementById("bHitsList");
+      bList.innerHTML = report.bHits.length
+        ? report.bHits.map(b => `<div class="diag-item"><strong>${b.label}（命中 ${b.count} 处）</strong><div style="color:#93a6ce;margin-top:4px;">${b.tip}</div></div>`).join("")
+        : `<div style="color:#86efac;font-size:13px;">未检出显著 B 级结构排比/冒号腔</div>`;
+
+      const dList = document.getElementById("diagList");
+      dList.innerHTML = report.sentenceDiagnostics.length
+        ? report.sentenceDiagnostics.map(d => `<div class="diag-item"><div class="orig">原句 #${d.index}：${d.original}</div><div class="rev">建议改写：${d.revised}</div><div style="color:#94a3b8;font-size:12px;margin-top:4px;">诊断：${d.issues.join("；")}</div></div>`).join("")
+        : `<div style="color:#86efac;font-size:13px;">当前段落无高危病句。</div>`;
+
+      if (isUnlocked) {
+        currentFullReport = report;
+        document.getElementById("paywallBox").style.display = "none";
+        const area = document.getElementById("unlockedArea");
+        area.style.display = "flex";
+        document.getElementById("unlockedBanner").textContent =
+          `支付宝交易已核验（订单 ${orderMeta.outTradeNo} · ¥${orderMeta.amount}），已解锁全部 ${report.sentenceDiagnostics.length} 条逐句精修与完整改写稿。`;
+        document.getElementById("rewriteBox").textContent = report.rewrittenText;
+      } else {
+        document.getElementById("paywallBox").style.display = "block";
+        document.getElementById("unlockedArea").style.display = "none";
+        const lc = report.lockedCounts || {};
+        document.getElementById("paywallDesc").innerHTML =
+          `免费版已展示核心诊断预览，另有 <strong>${lc.remainingAHits || 0} 类套话、${lc.remainingBHits || 0} 项结构指纹、${lc.remainingSentences || 0} 条逐句精修与完整改写稿</strong> 待解锁。通过支付宝 Vibe Pay 支付 <strong>¥1.99</strong> 立即获取。`;
+      }
+    }
+
+    document.getElementById("btnSample").addEventListener("click", () => {
+      document.getElementById("articleInput").value = SAMPLE_TEXT;
+    });
+
+    document.getElementById("btnClear").addEventListener("click", () => {
+      document.getElementById("articleInput").value = "";
+    });
+
+    document.getElementById("btnAnalyze").addEventListener("click", async () => {
+      const text = document.getElementById("articleInput").value.trim();
+      const status = document.getElementById("statusMsg");
+      status.textContent = "正在执行三层确定性体检…";
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        status.textContent = data.error || "扫描失败";
+        return;
+      }
+      currentReportId = data.reportId;
+      status.textContent = `体检完成（报告号 ${currentReportId}）。`;
+      renderReport(data.preview, false);
+    });
+
+    document.getElementById("btnPay").addEventListener("click", async () => {
+      if (!currentReportId) return;
+      const btn = document.getElementById("btnPay");
+      btn.disabled = true;
+      btn.textContent = "正在创建支付宝收款订单…";
+      try {
+        const res = await fetch("/api/orders/create", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reportId: currentReportId, planId: "single_unlock" })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "下单失败");
+        window.location.href = data.payUrl;
+      } catch (e) {
+        alert(e.message);
+        btn.disabled = false;
+        btn.textContent = "支付宝扫码 / 网页支付 ¥1.99 立即解锁";
+      }
+    });
+
+    document.getElementById("btnDownload").addEventListener("click", () => {
+      if (!currentFullReport) return;
+      const r = currentFullReport;
+      const md = [
+        `# 文章去 AI 味三层体检精修报告`,
+        `- AI 味指数：${r.aiScore}/100（${r.grade}）`,
+        `- 字数：${r.charCount} 字 ｜ 平均句长：${r.avgSentenceLen} 字`,
+        ``,
+        `## 一、逐句诊断与改写`,
+        ...r.sentenceDiagnostics.map(d => `- **原句 #${d.index}**：${d.original}\n  - **建议改写**：${d.revised}\n  - **原因**：${d.issues.join("；")}`),
+        ``,
+        `## 二、完整去 AI 味参考改写稿`,
+        r.rewrittenText
+      ].join("\n");
+      const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `detone-report-${currentReportId || Date.now()}.md`;
+      a.click();
+    });
+
+    async function checkReturnPayment() {
+      const sp = new URLSearchParams(window.location.search);
+      const outTradeNo = sp.get("out_trade_no");
+      const reportId = sp.get("report_id");
+      if (!outTradeNo) return;
+      currentReportId = reportId || "";
+      document.getElementById("statusMsg").textContent = `正在向支付宝服务端核验订单 ${outTradeNo} 支付状态…`;
+      const res = await fetch(`/api/orders/${encodeURIComponent(outTradeNo)}/status`);
+      const data = await res.json();
+      if (res.ok && data.status === "PAID" && data.fullReport) {
+        document.getElementById("statusMsg").textContent = `订单 ${outTradeNo} 已确认付款，完整精修报告已解锁！`;
+        renderReport(data.fullReport, true, data);
+      } else {
+        document.getElementById("statusMsg").textContent = `订单 ${outTradeNo} 当前状态：${data.status || "待支付"}，请完成支付后刷新查询。`;
+      }
+    }
+
+    loadHealth();
+    checkReturnPayment();
+  </script>
+</body>
+</html>

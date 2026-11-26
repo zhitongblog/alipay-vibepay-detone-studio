@@ -1,0 +1,17 @@
+{
+  "name": "alipay-vibepay-detone-studio",
+  "version": "1.0.0",
+  "description": "文章去AI味三层体检与精修工作台 — 支付宝 AI 付 Vibe Pay（AI 网页应用收款）实战应用",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/app.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
