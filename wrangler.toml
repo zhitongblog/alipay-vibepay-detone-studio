@@ -1,0 +1,8 @@
+name = "detone-studio"
+main = "worker/index.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+WATCHA_BASE_URL = "https://pay.watcha.cn"
+WATCHA_ENTITLEMENT_ID = "ent_01m8b0gfq92h0kgbm4y18rng17"
+WATCHA_BILLING_MODE = "one_time"

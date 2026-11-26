@@ -70,7 +70,7 @@ test("End-to-end analyze -> order create -> Alipay notify unlock -> idempotent s
     privateKey,
     alipayPublicKey: publicKey
   });
-  const app = createApp({ alipayClient: client });
+  const app = createApp({ alipayClient: client, watchaClient: { isConfigured: () => false } });
   const server = await new Promise((resolve) => {
     const s = app.listen(0, () => resolve(s));
   });
