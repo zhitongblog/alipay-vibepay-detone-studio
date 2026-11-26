@@ -5,6 +5,7 @@ const path = require("path");
 const express = require("express");
 const { analyzeArticle, toFreePreview } = require("./analyzer");
 const { AlipayWebPayClient } = require("./alipay-client");
+const { WatchaPayClient } = require("./watchapay-client");
 
 const PLANS = {
   single_unlock: {
@@ -26,24 +27,77 @@ const PLANS = {
 function createApp(options = {}) {
   const app = express();
   const alipay = options.alipayClient || new AlipayWebPayClient(options.alipayConfig);
+  const watcha = options.watchaClient || new WatchaPayClient(options.watchaConfig);
   const publicBaseUrl = (options.publicBaseUrl || process.env.PUBLIC_BASE_URL || "http://127.0.0.1:3088").replace(/\/+$/, "");
 
   // In-memory store (persists for process lifetime; easily swappable to SQLite/Redis)
   const reports = new Map();
   const orders = new Map();
 
+  // Stable server-issued user identity cookie (never trusts arbitrary client user_id)
+  function getOrCreateUserId(req, res) {
+    const cookieHeader = String(req.headers.cookie || "");
+    const m = cookieHeader.match(/(?:^|;\s*)detone_uid=([a-zA-Z0-9_-]{12,64})/);
+    if (m) return m[1];
+    const uid = "u_" + crypto.randomBytes(12).toString("hex");
+    res.setHeader("Set-Cookie", `detone_uid=${uid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
+    return uid;
+  }
+
   app.use(express.json({ limit: "512kb" }));
   app.use(express.urlencoded({ extended: true, limit: "512kb" }));
   app.use(express.static(path.join(__dirname, "..", "public")));
 
   app.get("/api/health", (_req, res) => {
+    const paymentMode = watcha.isConfigured()
+      ? "watchapay-vibe-pay"
+      : (alipay.isConfigured() ? alipay.env : "demo-sandbox-preview");
     res.json({
       status: "ok",
       product: "DeTone Studio · 文章去 AI 味三层体检精修台",
-      paymentMode: alipay.isConfigured() ? alipay.env : "demo-sandbox-preview",
+      paymentMode,
+      watchaConfigured: watcha.isConfigured(),
       alipayConfigured: alipay.isConfigured(),
       notifyUrlConfigured: Boolean(alipay.notifyUrl),
       plans: PLANS
+    });
+  });
+
+  // 爱猹收（Vibe Pay 个人即刻收）权益检查与解锁接口
+  app.get("/api/entitlement/check", async (req, res) => {
+    const userId = getOrCreateUserId(req, res);
+    const reportId = String(req.query.report_id || "").trim();
+    const rec = reportId ? reports.get(reportId) : null;
+
+    if (!watcha.isConfigured()) {
+      return res.status(400).json({ error: "WatchaPay 未配置。" });
+    }
+
+    const returnUrl = reportId
+      ? `${publicBaseUrl}/?report_id=${encodeURIComponent(reportId)}&check_entitlement=1`
+      : `${publicBaseUrl}/?check_entitlement=1`;
+
+    const result = await watcha.checkAccess({ userId, returnUrl });
+    if (!result.ok || result.access === "unavailable") {
+      return res.status(503).json({
+        access: "unavailable",
+        reason: result.reason || { code: "service_unavailable", message: "权益查询暂不可用（失败关闭保护）" }
+      });
+    }
+
+    if (result.access === "granted") {
+      if (rec) rec.unlocked = true;
+      return res.json({
+        access: "granted",
+        entitlement: result.entitlement,
+        fullReport: rec ? rec.full : null
+      });
+    }
+
+    return res.json({
+      access: "purchase_required",
+      entitlement: result.entitlement,
+      purchase: result.purchase
     });
   });
 
@@ -69,8 +123,9 @@ function createApp(options = {}) {
     });
   });
 
-  // 2. 创建支付宝 Vibe Pay 订单（alipay.trade.page.pay）
-  app.post("/api/orders/create", (req, res) => {
+  // 2. 创建支付宝 Vibe Pay 订单（优先爱猹收个人即刻收，否则 alipay.trade.page.pay）
+  app.post("/api/orders/create", async (req, res) => {
+    const userId = getOrCreateUserId(req, res);
     const { reportId, planId = "single_unlock" } = req.body || {};
     const record = reports.get(reportId);
     if (!record) {
@@ -79,6 +134,33 @@ function createApp(options = {}) {
     const plan = PLANS[planId];
     if (!plan) {
       return res.status(400).json({ error: "无效的商品档位。" });
+    }
+
+    // 路径 A：爱猹收（Vibe Pay 个人即刻收模式）
+    if (watcha.isConfigured()) {
+      const returnUrl = `${publicBaseUrl}/?report_id=${encodeURIComponent(reportId)}&check_entitlement=1`;
+      const accessRes = await watcha.checkAccess({ userId, returnUrl });
+      if (!accessRes.ok || accessRes.access === "unavailable") {
+        return res.status(503).json({ error: "支付权益服务暂时不可用，请稍后重试。" });
+      }
+      if (accessRes.access === "granted") {
+        record.unlocked = true;
+        return res.json({
+          mode: "watchapay-vibe-pay",
+          alreadyGranted: true,
+          fullReport: record.full
+        });
+      }
+      if (!accessRes.purchase || !accessRes.purchase.url) {
+        return res.status(503).json({ error: "当前商品暂无可用购买入口。" });
+      }
+      return res.json({
+        mode: "watchapay-vibe-pay",
+        amount: plan.amount,
+        subject: plan.name,
+        payUrl: accessRes.purchase.url,
+        qrCodeUrl: accessRes.purchase.qr_code_url || null
+      });
     }
 
     const outTradeNo = `DTN${Date.now()}${crypto.randomBytes(3).toString("hex").toUpperCase()}`;

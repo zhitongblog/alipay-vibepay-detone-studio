@@ -235,9 +235,11 @@
       const res = await fetch("/api/health");
       const data = await res.json();
       const badge = document.getElementById("modeBadge");
-      badge.textContent = data.alipayConfigured
-        ? `支付宝 Vibe Pay 已就绪（${data.paymentMode}）`
-        : "支付宝 Vibe Pay · 本地沙箱演示模式";
+      badge.textContent = data.watchaConfigured
+        ? "支付宝 Vibe Pay 已就绪（个人即刻收）"
+        : (data.alipayConfigured
+          ? `支付宝 Vibe Pay 已就绪（${data.paymentMode}）`
+          : "支付宝 Vibe Pay · 本地沙箱演示模式");
     }
 
     function renderReport(report, isUnlocked, orderMeta) {
@@ -326,6 +328,10 @@
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "下单失败");
+        if (data.alreadyGranted && data.fullReport) {
+          renderReport(data.fullReport, true, { outTradeNo: "VIBE_ENTITLEMENT", amount: "已购权益" });
+          return;
+        }
         window.location.href = data.payUrl;
       } catch (e) {
         alert(e.message);
@@ -359,6 +365,20 @@
       const sp = new URLSearchParams(window.location.search);
       const outTradeNo = sp.get("out_trade_no");
       const reportId = sp.get("report_id");
+      const checkEntitlement = sp.get("check_entitlement");
+      if (checkEntitlement && reportId) {
+        currentReportId = reportId;
+        document.getElementById("statusMsg").textContent = "正在核验支付宝 Vibe Pay 购买权益…";
+        const res = await fetch(`/api/entitlement/check?report_id=${encodeURIComponent(reportId)}`);
+        const data = await res.json();
+        if (res.ok && data.access === "granted" && data.fullReport) {
+          document.getElementById("statusMsg").textContent = "支付宝 Vibe Pay 权益已核验，完整精修报告已解锁！";
+          renderReport(data.fullReport, true, { outTradeNo: "VIBE_PAY_GRANTED", amount: "已解锁" });
+        } else {
+          document.getElementById("statusMsg").textContent = "尚未检测到已购权益，如刚完成付款请稍后刷新页面重试。";
+        }
+        return;
+      }
       if (!outTradeNo) return;
       currentReportId = reportId || "";
       document.getElementById("statusMsg").textContent = `正在向支付宝服务端核验订单 ${outTradeNo} 支付状态…`;
